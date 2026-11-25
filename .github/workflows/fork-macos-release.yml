@@ -1,0 +1,101 @@
+name: Apple Silicon release
+
+on:
+  push:
+    branches: ["release/macos-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.repository == 'ethonchen/motty' && startsWith(github.ref, 'refs/heads/release/macos-')
+    runs-on: macos-15
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: motty
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: vivaui/viva
+          ref: 5e86608821005f16a8abb6d90542386a5f299b2e
+          path: viva
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version-file: motty/go.mod
+          cache-dependency-path: |
+            motty/go.sum
+            viva/go.sum
+
+      - name: Test and build the arm64 app
+        working-directory: motty
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          go test ./internal/i18n ./cmd/motty -count=1
+          go test ./internal/workbench -run 'Test(TerminalTransparency|EverySavedStateField|ABackgroundPicture|SettingsSearch)' -count=1
+          (cd ../viva && go build -o "$RUNNER_TEMP/viva" ./cmd/viva)
+          "$RUNNER_TEMP/viva" build --target darwin --arch arm64 -o "$RUNNER_TEMP/motty"
+          go run ./tools/checkbuild -program "$RUNNER_TEMP/motty" -revision "$GITHUB_SHA" \
+            -time "$(git show -s --format=%cI HEAD)" -target darwin -arch arm64
+          "$RUNNER_TEMP/viva" package --target darwin --arch arm64 --program "$RUNNER_TEMP/motty" \
+            --format dmg --sign-identity - -o "$RUNNER_TEMP/dist/Motty.app"
+
+      - name: Verify the installer
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+          images=(motty-*-darwin-arm64.dmg)
+          test "${#images[@]}" = 1
+          hdiutil verify "${images[0]}"
+          mountpoint="$RUNNER_TEMP/installed-image"
+          mkdir -p "$mountpoint"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "${images[0]}"
+          trap 'hdiutil detach "$mountpoint"' EXIT
+          app="$mountpoint/Motty.app"
+          test "$(lipo -archs "$app/Contents/MacOS/motty")" = arm64
+          codesign --verify --strict --deep "$app"
+          test "$(readlink "$mountpoint/Applications")" = /Applications
+          shasum -a 256 "${images[0]}" > SHA256SUMS
+
+      - name: Publish the verified DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+          tag="${GITHUB_REF_NAME#release/}"
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          适用于 Apple Silicon Mac，包括 MacBook M5。打开 DMG，将 Motty 拖入 Applications。
+
+          在「设置 → 外观 → 终端背景透明度」中可将透明度从 0% 调至 100%。文字、光标和 ANSI 色块保持清晰。调回 0% 可恢复原有底色或背景图片。
+
+          此 fork 构建使用 ad-hoc 签名，未经 Apple 公证。SHA256SUMS 可用于校验下载文件。
+          NOTES
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish > "$RUNNER_TEMP/existing.json"; then
+            if jq -e '.isDraft == false' "$RUNNER_TEMP/existing.json" >/dev/null; then
+              test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)" = "$GITHUB_SHA"
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/published"
+              (cd "$RUNNER_TEMP/published" && shasum -a 256 -c SHA256SUMS)
+              exit 0
+            fi
+            test "$(jq -r .targetCommitish "$RUNNER_TEMP/existing.json")" = "$GITHUB_SHA"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+              --title "Motty · Apple Silicon · 终端背景透明度" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber motty-*-darwin-arm64.dmg SHA256SUMS
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/uploaded"
+          (cd "$RUNNER_TEMP/uploaded" && shasum -a 256 -c SHA256SUMS)
+          cmp SHA256SUMS "$RUNNER_TEMP/uploaded/SHA256SUMS"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
