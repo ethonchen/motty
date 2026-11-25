@@ -248,9 +248,8 @@ func (state *State) Paint(canvas *gfx.Canvas, size gfx.Size) {
 		state.fileNotices.paint(canvas, state.Theme(), state.windowRect())
 		return
 	}
-	// The window is a bar over a body. The terminals show the picture through their
-	// own ground, so with one set only the bar is shell-colored; the shell behind
-	// them must not cover it.
+	// The shell normally paints one opaque root. A terminal can instead show
+	// the desktop or a picture through its own ground; give the bar its own fill.
 	picture := state.paintBackground(canvas, size)
 	terminal := state.terminalPage()
 	fileManager := state.activeSFTPWindow() != nil
@@ -284,7 +283,7 @@ func (state *State) Paint(canvas *gfx.Canvas, size gfx.Size) {
 	}
 	cardRight += state.toolbarDockSideReserveFor(false, false)
 	chrome.workspaceSlot = ui.Box{}
-	chrome.shellPicture = picture
+	chrome.shellBackdrop = picture || (terminal && state.desktopTransparency() > 0)
 	chrome.shellHeight = size.Height
 	chrome.shellGeometry = geometry
 	chrome.shellScroll = scroll
@@ -504,6 +503,12 @@ func (state *State) windowPage() *ui.Page {
 func (state *State) WindowConfig(base app.Config) app.Config {
 	config := ui.Configure(state.windowPage(), base)
 	config.Paint = base.Paint
+	if state.options.TerminalTransparency {
+		// Viva treats an all-zero clear color as unspecified. This alpha rounds
+		// to transparent black in the macOS BGRA8 drawable and opts both the
+		// NSWindow and its Metal layer into per-pixel compositing at creation.
+		config.ClearColor = app.Color{Alpha: 1.0 / 65535}
+	}
 	// The assistant owns the wheel over its own panel: its lists keep their
 	// offsets in the page, but a modal dialog must still keep them still, which
 	// the page's generic scroll-area routing does not know. Everything else the
@@ -625,11 +630,11 @@ func (state *State) declareShell(c ui.C) {
 	}
 	chrome, pal := &state.chrome, state.pal
 	root := ui.Column(c).Fill()
-	if !chrome.shellPicture {
+	if !chrome.shellBackdrop {
 		root.Background(state.windowFrameColor())
 	}
 	root.Children(func() {
-		state.declareWindowBar(c, &chrome.bar, false, chrome.shellPicture, chrome.shellGeometry, chrome.shellScroll)
+		state.declareWindowBar(c, &chrome.bar, false, chrome.shellBackdrop, chrome.shellGeometry, chrome.shellScroll)
 		if chrome.shellFullPage {
 			return
 		}
@@ -774,7 +779,7 @@ func (state *State) declareProbeBar(c ui.C) {
 // the buttons; when even the narrowest do not fit they scroll under a clip, and the
 // new-tab button stays at the end of that room instead of being pushed out of the
 // window. With probe set only the places are declared, for windowBarGeometry.
-func (state *State) declareWindowBar(c ui.C, bar *windowBar, probe, picture bool, geometry barGeometry, scroll float32) {
+func (state *State) declareWindowBar(c ui.C, bar *windowBar, probe, backdrop bool, geometry barGeometry, scroll float32) {
 	m, pal, chrome := state.messages, state.pal, &state.chrome
 	leading, _ := state.windowTitlebarInsets()
 	visibleFileTabs := 0
@@ -798,7 +803,7 @@ func (state *State) declareWindowBar(c ui.C, bar *windowBar, probe, picture bool
 		// after it, take their own presses.
 		row.MovesWindow()
 	}
-	if picture {
+	if backdrop {
 		row.Background(state.windowFrameColor())
 	}
 	row.Children(func() {
@@ -1255,7 +1260,7 @@ type chromeLayout struct {
 	// the tabs come out; probeInput is what its cached view reads.
 	windowPage     *ui.Page
 	workspaceSlot  ui.Box
-	shellPicture   bool
+	shellBackdrop  bool
 	shellHeight    float32
 	shellGeometry  barGeometry
 	shellScroll    float32
